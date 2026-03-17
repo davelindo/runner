@@ -4,9 +4,11 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using GitHub.DistributedTask.WebApi;
+using GitHub.Runner.Common;
 using GitHub.Runner.Listener;
 using GitHub.Runner.Listener.Configuration;
 using GitHub.Services.Common;
+using GitHub.Services.OAuth;
 using Moq;
 using Xunit;
 
@@ -360,6 +362,133 @@ namespace GitHub.Runner.Common.Tests.Listener
                 _credMgr.Verify(x => x.LoadCredentials(true), Times.Exactly(3));
 
                 Assert.False(tc.AllowAuthMigration);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task GetNextMessage_InvalidClientStopsRetrying()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                // Arrange.
+                _credMgr.Setup(x => x.LoadCredentials(true)).Returns(new VssCredentials());
+
+                var expectedSession = new TaskAgentSession();
+                _brokerServer
+                    .Setup(x => x.CreateSessionAsync(
+                        It.Is<TaskAgentSession>(y => y != null),
+                        tokenSource.Token))
+                    .Returns(Task.FromResult(expectedSession));
+
+                var oauthError = new VssOAuthTokenRequestException("Registration was not found.")
+                {
+                    Error = "invalid_client"
+                };
+
+                _brokerServer
+                    .Setup(x => x.GetRunnerMessageAsync(
+                        It.IsAny<Guid?>(),
+                        It.IsAny<TaskAgentStatus>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<bool>(),
+                        It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(oauthError);
+
+                // Act.
+                BrokerMessageListener listener = new();
+                listener.Initialize(tc);
+
+                CreateSessionResult result = await listener.CreateSessionAsync(tokenSource.Token);
+                Assert.Equal(CreateSessionResult.Success, result);
+
+                var ex = await Assert.ThrowsAsync<NonRetryableException>(() => listener.GetNextMessageAsync(tokenSource.Token));
+
+                // Assert.
+                Assert.Same(oauthError, ex.InnerException);
+                _brokerServer.Verify(x => x.GetRunnerMessageAsync(
+                    It.IsAny<Guid?>(),
+                    It.IsAny<TaskAgentStatus>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<CancellationToken>()), Times.Once());
+                _brokerServer.Verify(x => x.ConnectAsync(It.IsAny<Uri>(), It.IsAny<VssCredentials>()), Times.Once());
+                _credMgr.Verify(x => x.LoadCredentials(true), Times.Once());
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task GetNextMessage_ServerErrorRetries()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                // Arrange.
+                _credMgr.Setup(x => x.LoadCredentials(true)).Returns(new VssCredentials());
+
+                var expectedSession = new TaskAgentSession();
+                _brokerServer
+                    .Setup(x => x.CreateSessionAsync(
+                        It.Is<TaskAgentSession>(y => y != null),
+                        tokenSource.Token))
+                    .Returns(Task.FromResult(expectedSession));
+
+                var expectedMessage = new TaskAgentMessage();
+                var callCount = 0;
+                _brokerServer
+                    .Setup(x => x.GetRunnerMessageAsync(
+                        It.IsAny<Guid?>(),
+                        It.IsAny<TaskAgentStatus>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<bool>(),
+                        It.IsAny<CancellationToken>()))
+                    .Returns(async () =>
+                    {
+                        await Task.Yield();
+                        callCount++;
+                        if (callCount == 1)
+                        {
+                            throw new VssOAuthTokenRequestException("Temporary auth failure")
+                            {
+                                Error = "server_error"
+                            };
+                        }
+
+                        return expectedMessage;
+                    });
+
+                // Act.
+                BrokerMessageListener listener = new();
+                listener.Initialize(tc);
+
+                CreateSessionResult result = await listener.CreateSessionAsync(tokenSource.Token);
+                Assert.Equal(CreateSessionResult.Success, result);
+
+                var message = await listener.GetNextMessageAsync(tokenSource.Token);
+
+                // Assert.
+                Assert.Same(expectedMessage, message);
+                Assert.Equal(2, callCount);
+                _brokerServer.Verify(x => x.GetRunnerMessageAsync(
+                    It.IsAny<Guid?>(),
+                    It.IsAny<TaskAgentStatus>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<CancellationToken>()), Times.Exactly(2));
+                _brokerServer.Verify(x => x.ConnectAsync(It.IsAny<Uri>(), It.IsAny<VssCredentials>()), Times.Exactly(2));
+                _credMgr.Verify(x => x.LoadCredentials(true), Times.Exactly(2));
             }
         }
 
