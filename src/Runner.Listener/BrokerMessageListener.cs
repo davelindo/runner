@@ -439,7 +439,8 @@ namespace GitHub.Runner.Listener
                 ex is TaskAgentSessionExpiredException ||
                 ex is AccessDeniedException ||
                 ex is RunnerNotFoundException ||
-                ex is VssUnauthorizedException)
+                ex is VssUnauthorizedException ||
+                (ex is VssOAuthTokenRequestException oauthEx && oauthEx.Error != "server_error"))
             {
                 Trace.Info($"Non-retriable exception: {ex.Message}");
                 return false;
